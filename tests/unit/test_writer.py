@@ -70,6 +70,24 @@ def test_a_skipped_position_does_not_block_the_rest(tmp_path: Path) -> None:
     assert [line["record_index"] for line in _lines(path)] == [1]
 
 
+def test_a_submit_drains_past_a_buffered_skip(tmp_path: Path) -> None:
+    # The other direction of the same interleaving: the discard arrives first and parks itself,
+    # and it is the earlier success that walks past it. Serializing that sentinel put literal
+    # `null` lines into the corpus, which every later reader of the file then choked on.
+    path = tmp_path / "out.jsonl"
+    writer = OrderedWriter(path=path)
+    writer.open()
+    writer.skip(1)
+    writer.submit(2, _record(2))
+    assert writer.submit(0, _record(0)) == 2
+    writer.close()
+    assert [line["record_index"] for line in _lines(path)] == [0, 2]
+    assert "null" not in path.read_text()
+    assert writer.records_written == 2
+    assert writer.bytes_written == path.stat().st_size
+    assert writer.resume_position == 3  # position 2 was the last one to produce a record
+
+
 def test_rewriting_an_earlier_position_is_an_error(tmp_path: Path) -> None:
     writer = OrderedWriter(path=tmp_path / "out.jsonl")
     writer.open()
