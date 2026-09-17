@@ -49,6 +49,12 @@ class RunReport:
     composition_drift_pp: dict[str, dict[str, float]] = field(default_factory=dict)
     resumed_count: int = 0
     budget: dict[str, Any] | None = None
+    #: What was asked for, beside what was written, so a short corpus is visible without
+    #: cross-referencing the config (FR-040).
+    records_requested: int = 0
+    #: Replacement slots spent making the corpus reach that number, and the rounds it took.
+    top_up_slots: int = 0
+    top_up_rounds: int = 0
 
     @property
     def verdict(self) -> Verdict:
@@ -82,6 +88,11 @@ class RunReport:
             "outcome": self.outcome.value,
             "records_generated": self.records_generated,
             "records_written": self.records_written,
+            "records_requested": self.records_requested,
+            # Generation beyond the requested count, spent replacing discarded records. Reported
+            # because it is the run's variable cost: silently adding work would be as opaque as
+            # silently dropping records (Constitution Principle III).
+            "top_up": {"slots": self.top_up_slots, "rounds": self.top_up_rounds},
             "discards": dict(sorted(self.discards.items())),
             "retry_counts": self.retry_counts,
             "duplicate_count": self.duplicate_count,
@@ -127,7 +138,12 @@ class RunReport:
         """The human rendering, derived from the same object as the JSON."""
         lines = [
             f"run {self.run_id}: {self.outcome.value} ({self.verdict.value})",
-            f"  records: {self.records_written} written of {self.records_generated} generated",
+            f"  records: {self.records_written} written of {self.records_generated} generated"
+            + (
+                f", {self.records_requested} requested"
+                if self.records_requested and self.records_requested != self.records_written
+                else ""
+            ),
         ]
         if self.discards:
             listed = ", ".join(

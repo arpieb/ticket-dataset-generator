@@ -51,7 +51,13 @@ from ticket_dataset_generator.model.client import (
     ModelUnavailable,
 )
 from ticket_dataset_generator.model.wire import GeneratedConversation, JudgeVerdict, response_schema
-from ticket_dataset_generator.planning.slots import Slot, assign_subdomains, plan_slots
+from ticket_dataset_generator.planning.apportion import apportion
+from ticket_dataset_generator.planning.slots import (
+    Slot,
+    assign_subdomains,
+    plan_slots,
+    plan_top_up_slots,
+)
 from ticket_dataset_generator.planning.tolerance import attribute as attribute_drift
 from ticket_dataset_generator.planning.tolerance import check as tolerance_check
 from ticket_dataset_generator.privacy.canaries import FLOOR_CANARIES
@@ -84,6 +90,7 @@ from ticket_dataset_generator.run.revision import (
 )
 from ticket_dataset_generator.run.thresholds import discard_rate_breaches, should_stop_early
 from ticket_dataset_generator.run.writer import OrderedWriter, claim_destination, publish
+from ticket_dataset_generator.schema.enums import COMPOSITION_DIMENSIONS
 from ticket_dataset_generator.schema.record import TicketRecord
 from ticket_dataset_generator.schema.version import SCHEMA_VERSION
 
@@ -164,6 +171,9 @@ class GenerationRun:
     assigned_composition: dict = field(default_factory=dict)
     requested_run_id: str | None = None
     budget: BudgetTracker | None = None
+    #: Replacement slots planned for discarded records, and the rounds it took (FR-040).
+    top_up_slots: int = 0
+    top_up_rounds: int = 0
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
@@ -385,11 +395,20 @@ class GenerationRun:
             start_position=start_position,
             truncate_to=resumed.bytes_written if resumed else None,
         )
+        # What the corpus holds per member, maintained as records are written so the top-up can
+        # size its rounds without re-reading the corpus every time (FR-012).
+        achieved_counts: dict[str, Counter[str]] = {
+            dimension: Counter() for dimension in COMPOSITION_DIMENSIONS
+        }
         if resumed:
             # Continue the tallies rather than restarting them, so one manifest describes the
             # whole corpus and its accounting reconciles across segments (FR-015c).
             writer.records_written = resumed.records_written
             slots = [slot for slot in slots if slot.position >= start_position]
+            self.top_up_slots = resumed.top_up_slots
+            # One scan, after the truncation above, so the counters describe the prefix that
+            # survived rather than the bytes the interrupted run had got as far as.
+            _, achieved_counts = self._composition_counts(writer.path)
         quarantine = Quarantine(path=self.staging_dir / "quarantine.jsonl")
         duplicates = DuplicateCounter()
         scores: list[float] = []
@@ -420,6 +439,9 @@ class GenerationRun:
                     ]
                 )
                 scores.append(outcome.record["quality"]["coherence_score"])
+                metadata = outcome.record["metadata"]
+                for dimension in COMPOSITION_DIMENSIONS:
+                    achieved_counts[dimension][metadata[dimension]] += 1
                 writer.submit(outcome.position, outcome.record)
             else:
                 writer.skip(outcome.position)
@@ -463,20 +485,89 @@ class GenerationRun:
                 records_written=writer.records_written,
                 resumes=(resumed.resumes + 1) if resumed else 0,
                 segments=list(resumed.segments) if resumed else [],
+                # Carried so the ceiling bounds the whole run rather than resetting at each
+                # resume, which would make it no ceiling at all.
+                top_up_slots=self.top_up_slots,
             ).write(self.staging_dir)
 
-        try:
-            stats = await run_slots(
-                slots,
+        async def wave(work: list[Slot], *, failure_limit: int | None = None) -> PipelineStats:
+            return await run_slots(
+                work,
                 self._attempt,
                 max_concurrency=self.config.max_concurrency,
                 max_attempts=self.config.max_attempts_per_slot,
-                consecutive_failure_limit=self.config.consecutive_failure_limit,
+                consecutive_failure_limit=failure_limit or self.config.consecutive_failure_limit,
                 on_outcome=on_outcome,
                 on_attempt=on_attempt,
                 stats=stats,
                 on_progress=self._progress_hook(checkpoint_now, stats),
             )
+
+        async def top_up() -> None:
+            """Replace discarded records until the corpus holds what was asked for (FR-040).
+
+            A discard costs the corpus a record, and the original design let that come straight
+            off the top: a run asked for 100,000 and published whatever survived. Replacing the
+            loss keeps ``record_count`` a statement about the corpus rather than about how many
+            slots were attempted.
+
+            Each round repairs the *deficit* — what apportionment assigned minus what the corpus
+            holds — so the replacements restore the composition the discards took out rather than
+            diluting it further. The rounds repeat because a replacement can itself be discarded.
+            """
+            if not self.config.top_up:
+                return
+            assert self.document is not None
+            target = apportion(self.config)
+            ceiling = int(self.config.record_count * self.config.max_top_up_ratio)
+            while (shortfall := self.config.record_count - writer.records_written) > 0:
+                room = ceiling - self.top_up_slots
+                if room <= 0:
+                    # Out of budget. The run does not publish a short corpus quietly: the
+                    # shortfall is a threshold failure below.
+                    break
+                size = min(shortfall, room)
+                deficit = {
+                    dimension: {
+                        member: assigned - achieved_counts[dimension][member]
+                        for member, assigned in target[dimension].items()
+                    }
+                    for dimension in COMPOSITION_DIMENSIONS
+                }
+                replacements = assign_subdomains(
+                    plan_top_up_slots(
+                        self.config,
+                        self.seed,
+                        deficit,
+                        start_position=writer.next_position,
+                        count=size,
+                        round_index=self.top_up_rounds,
+                    ),
+                    self.document.subdomains,
+                    self.seed,
+                )
+                self.top_up_rounds += 1
+                self.top_up_slots += size
+                before = writer.records_written
+                # The consecutive-failure breaker is deliberately out of play here. It exists to
+                # notice a provider that has gone down, and it reads consecutive failures as that
+                # signal — but a top-up round is *made of* the cases that already failed, so a
+                # category the generator cannot write would trip it every time and report an
+                # interruption where there was none. The round guard below is the better-aimed
+                # instrument, and the discard-rate gates (FR-009k, FR-021a) still stop the run
+                # through ``on_progress`` if the corpus as a whole is going bad. The counter is
+                # reset as well as the limit raised: it carries the tail of the main wave, which
+                # would otherwise trip the round before it had failed at anything itself.
+                stats.consecutive_failures = 0
+                await wave(replacements, failure_limit=size + 1)
+                if writer.records_written == before:
+                    # A whole round produced nothing, so another would not either. Stop rather
+                    # than spend the ceiling discovering that; the discard tallies say why.
+                    break
+
+        try:
+            stats = await wave(slots)
+            await top_up()
         except RunStopped:
             outcome_state = RunOutcome.STOPPED
         finally:
@@ -489,8 +580,13 @@ class GenerationRun:
 
         # The composition tolerance is only meaningful once every slot has been attempted, so a
         # stopped run is not judged on it (FR-037a).
+        completed = outcome_state is RunOutcome.COMPLETED
         failures = self._threshold_failures(
-            stats, achieved if outcome_state is RunOutcome.COMPLETED else None
+            stats,
+            achieved if completed else None,
+            # Like the composition tolerance, only meaningful once every slot has been attempted:
+            # a stopped run is short by definition and resuming is what fixes it (FR-037a).
+            writer.records_written if completed else None,
         )
         if failures and outcome_state is RunOutcome.COMPLETED:
             outcome_state = RunOutcome.FAILED
@@ -540,6 +636,9 @@ class GenerationRun:
             failures=failures,
             resumed_count=manifest.resumed_count,
             budget=self.budget.as_dict() if self.budget else None,
+            records_requested=self.config.record_count,
+            top_up_slots=self.top_up_slots,
+            top_up_rounds=self.top_up_rounds,
         )
         report_path = report.write(manifest_dir, published=artifact is not None)
 
@@ -562,6 +661,10 @@ class GenerationRun:
                 records_written=writer.records_written,
                 resumes=manifest.resumed_count,
                 segments=[asdict(segment) for segment in manifest.segments],
+                # This write supersedes the one in ``checkpoint_now``, so it has to carry
+                # everything that one does — omitting the spend here would hand the next resume
+                # a fresh ceiling and let a run top up without bound across restarts.
+                top_up_slots=self.top_up_slots,
             ).write(self.staging_dir)
 
         return RunResult(
@@ -642,23 +745,27 @@ class GenerationRun:
                     Counter(getattr(slot, dimension) for slot in slots).items()
                 )
             }
-            for dimension in ("category", "priority", "channel", "resolution_status")
+            for dimension in COMPOSITION_DIMENSIONS
         }
 
-    def _achieved_composition(self, path: Path) -> dict[str, dict[str, float]]:
-        """What the written corpus actually contains.
+    def _composition_counts(self, path: Path) -> tuple[int, dict[str, Counter[str]]]:
+        """Per-member record counts in the written corpus, and the total.
 
         Streamed line by line and counted as it goes. Reading the corpus into a list would make
         peak memory scale with corpus size — the exact property FR-012 forbids, and one that only
         shows up at the scale where it matters.
+
+        Counts rather than proportions, because the top-up needs to know how many records each
+        member is *missing*, and a proportion cannot answer that without multiplying back out.
         """
         import json as _json
 
+        counters: dict[str, Counter[str]] = {
+            dimension: Counter() for dimension in COMPOSITION_DIMENSIONS
+        }
         path = Path(path)
         if not path.exists():
-            return {}
-        dimensions = ("category", "priority", "channel", "resolution_status")
-        counters: dict[str, Counter[str]] = {dimension: Counter() for dimension in dimensions}
+            return 0, counters
         total = 0
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -666,16 +773,26 @@ class GenerationRun:
                     continue
                 metadata = _json.loads(line)["metadata"]
                 total += 1
-                for dimension in dimensions:
+                for dimension in COMPOSITION_DIMENSIONS:
                     counters[dimension][metadata[dimension]] += 1
+        return total, counters
+
+    @staticmethod
+    def _as_proportions(
+        total: int, counters: dict[str, Counter[str]]
+    ) -> dict[str, dict[str, float]]:
         if total == 0:
             return {}
         return {
             dimension: {
                 member: count / total for member, count in sorted(counters[dimension].items())
             }
-            for dimension in dimensions
+            for dimension in COMPOSITION_DIMENSIONS
         }
+
+    def _achieved_composition(self, path: Path) -> dict[str, dict[str, float]]:
+        """What the written corpus actually contains, as proportions (FR-031a)."""
+        return self._as_proportions(*self._composition_counts(path))
 
     def _build_manifest(
         self,
@@ -697,7 +814,9 @@ class GenerationRun:
             started_at=self.started_at.isoformat(),
             completed_at=completed_at.isoformat(),
             first_record_index=self.resumed_from.next_position if self.resumed_from else 0,
-            last_record_index=max(writer.records_written - 1, 0),
+            # The highest position that produced a record, which is not ``records_written - 1``:
+            # discarded positions leave gaps, and a top-up's replacements sit past record_count.
+            last_record_index=max(writer.last_written_position, 0),
         )
         previous = (
             [Segment(**entry) for entry in self.resumed_from.segments] if self.resumed_from else []
@@ -780,7 +899,10 @@ class GenerationRun:
         return hook
 
     def _threshold_failures(
-        self, stats: PipelineStats, achieved: dict[str, dict[str, float]] | None = None
+        self,
+        stats: PipelineStats,
+        achieved: dict[str, dict[str, float]] | None = None,
+        records_written: int | None = None,
     ) -> list[str]:
         """Run-level thresholds, evaluated over the FR-026a denominator.
 
@@ -807,6 +929,21 @@ class GenerationRun:
                     achieved,
                     self.config.composition_tolerance_pp,
                 )
+            )
+        # A corpus smaller than the one that was asked for is a failure, not a footnote in the
+        # report (FR-040). Reached only when top-up is off, or when its ceiling ran out before
+        # the corpus filled — either way the operator asked for N records and did not get them.
+        if records_written is not None and records_written < self.config.record_count:
+            short = self.config.record_count - records_written
+            remedy = (
+                f"raise max_top_up_ratio above {self.config.max_top_up_ratio:g}"
+                if self.config.top_up
+                else "set top_up = true"
+            )
+            failures.append(
+                f"records_written: {records_written} of {self.config.record_count} requested "
+                f"({short} short). Discarded records were not replaced; {remedy}, or fix what "
+                "the discard tallies are reporting."
             )
         return failures
 

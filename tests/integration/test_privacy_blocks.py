@@ -19,6 +19,10 @@ def _config(tmp_path: Path, **overrides) -> GenerationConfig:
         "output_path": tmp_path / "release" / "corpus.jsonl",
         "composition_tolerance_pp": 20.0,
         "max_attempts_per_slot": 1,
+        # These tests count blocked records against a known number of planned slots. Top-up
+        # would add replacement rounds — which the gate blocks just the same — and the counts
+        # would then measure the ceiling rather than the gate (FR-040).
+        "top_up": False,
         "composition": {
             "category": {"account": 0.5, "technical": 0.5},
             "priority": {"normal": 1.0},

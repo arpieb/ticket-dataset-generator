@@ -157,7 +157,9 @@ async def test_malformed_responses_are_discarded_and_counted(
     tmp_path: Path, staging_root: Path
 ) -> None:
     client = FakeModelClient(scripts={ModelRole.GENERATOR: [Script(behavior="malformed")]})
-    result = await _run(make_config(tmp_path, record_count=8, max_attempts_per_slot=2), client)
+    result = await _run(
+        make_config(tmp_path, record_count=8, max_attempts_per_slot=2, top_up=False), client
+    )
     assert result.records_written == 0
     assert result.stats.discards[DiscardReason.STRUCTURAL_INVALID] > 0
     # Every response is counted once per attempt, which is the denominator every rate uses.
@@ -166,14 +168,18 @@ async def test_malformed_responses_are_discarded_and_counted(
 
 async def test_a_refusal_has_its_own_reason(tmp_path: Path, staging_root: Path) -> None:
     client = FakeModelClient(scripts={ModelRole.GENERATOR: [Script(behavior="refusal")]})
-    result = await _run(make_config(tmp_path, record_count=6, max_attempts_per_slot=1), client)
+    result = await _run(
+        make_config(tmp_path, record_count=6, max_attempts_per_slot=1, top_up=False), client
+    )
     assert result.stats.discards[DiscardReason.MODEL_REFUSAL] == 6
     assert DiscardReason.STRUCTURAL_INVALID not in result.stats.discards
 
 
 async def test_a_low_score_is_discarded_under_coherence(tmp_path: Path, staging_root: Path) -> None:
     client = FakeModelClient(judge_score=0.1)
-    result = await _run(make_config(tmp_path, record_count=6, max_attempts_per_slot=1), client)
+    result = await _run(
+        make_config(tmp_path, record_count=6, max_attempts_per_slot=1, top_up=False), client
+    )
     assert result.records_written == 0
     assert result.stats.discards[DiscardReason.COHERENCE_BELOW_THRESHOLD] == 6
 
@@ -193,7 +199,7 @@ async def test_a_wrong_turn_count_lands_under_its_own_reason(
         scripts={ModelRole.GENERATOR: [Script(behavior="ok", payload=payload)]}
     )
     config = make_config(
-        tmp_path, record_count=4, max_attempts_per_slot=1, turns={"min": 6, "max": 6}
+        tmp_path, record_count=4, max_attempts_per_slot=1, turns={"min": 6, "max": 6}, top_up=False
     )
     result = await _run(config, client)
     assert result.stats.discards[DiscardReason.TURN_COUNT_OUT_OF_RANGE] == 4
@@ -240,7 +246,10 @@ async def test_a_discarded_slot_does_not_block_later_records(
 
     client = FakeModelClient(responder=responder)
     result = await _run(
-        make_config(tmp_path, record_count=6, max_attempts_per_slot=1, max_concurrency=1), client
+        make_config(
+            tmp_path, record_count=6, max_attempts_per_slot=1, max_concurrency=1, top_up=False
+        ),
+        client,
     )
     assert result.records_written == 5
     indices = [record["record_index"] for record in _records(_output(result))]

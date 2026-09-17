@@ -65,6 +65,9 @@ class Checkpoint:
     records_written: int = 0
     resumes: int = 0
     segments: list[dict[str, Any]] = field(default_factory=list)
+    #: Replacement slots spent so far on making the corpus reach ``record_count`` (FR-040).
+    #: Defaulted, so a checkpoint written before top-up existed still loads.
+    top_up_slots: int = 0
 
     def write(self, directory: Path) -> Path:
         """Write durably, via a temp file and a rename, so it is never half-written."""

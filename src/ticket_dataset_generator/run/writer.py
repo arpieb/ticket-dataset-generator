@@ -57,6 +57,17 @@ class OrderedWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
+    def next_position(self) -> int:
+        """The lowest position not yet submitted or skipped — where a top-up wave continues.
+
+        Distinct from :attr:`resume_position`, which points just after the last position that
+        actually produced a record. A top-up must not reuse a position the writer has already
+        accounted for, even one that produced nothing, or the next submit would be rejected as
+        already written.
+        """
+        return self._next_position
+
+    @property
     def resume_position(self) -> int:
         """Where a resume should continue: just after the last record actually written."""
         return self.last_written_position + 1
@@ -78,22 +89,23 @@ class OrderedWriter:
         if position < self._next_position:
             raise ValueError(f"position {position} was already written")
         self._pending[position] = record
-        written = 0
-        while self._next_position in self._pending:
-            line = serialize(self._pending.pop(self._next_position)) + "\n"
-            self._handle.write(line)
-            self.bytes_written += len(line.encode("utf-8"))
-            self.records_written += 1
-            self.last_written_position = self._next_position
-            self._next_position += 1
-            written += 1
-        return written
+        return self._drain()
 
     def skip(self, position: int) -> int:
         """Mark a position as producing no record, so later ones are not blocked behind it."""
         if position < self._next_position:
             return 0
         self._pending[position] = None  # type: ignore[assignment]
+        return self._drain()
+
+    def _drain(self) -> int:
+        """Write the contiguous run starting at the next position. Returns records written.
+
+        Both entry points drain through here because either one can be the call that unblocks a
+        buffered ``skip``: a discard at a later position parks its ``None`` sentinel, and it is
+        the *earlier* success arriving afterwards that walks past it. A drain that serialized
+        whatever it popped would write that sentinel out as a literal ``null`` line.
+        """
         written = 0
         while self._next_position in self._pending:
             record = self._pending.pop(self._next_position)

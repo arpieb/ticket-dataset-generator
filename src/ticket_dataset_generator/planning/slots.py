@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 
 from ticket_dataset_generator.config.models import GenerationConfig
-from ticket_dataset_generator.planning.apportion import apportion
+from ticket_dataset_generator.planning.apportion import apportion, apportion_dimension
 from ticket_dataset_generator.planning.seeding import slot_random, stream_random
 from ticket_dataset_generator.schema.enums import COMPOSITION_DIMENSIONS, ResolutionStatus
 
@@ -65,48 +65,119 @@ def _assignment_pools(config: GenerationConfig, seed: int) -> dict[str, list[str
     return pools
 
 
-def plan_slots(config: GenerationConfig, seed: int) -> list[Slot]:
-    """Every slot for the run, in position order."""
-    pools = _assignment_pools(config, seed)
+def _slot_at(
+    config: GenerationConfig,
+    seed: int,
+    position: int,
+    assignment: dict[str, str],
+) -> Slot:
+    """One slot: the composition ``assignment`` it was given, plus its seeded draws.
+
+    Split out of :func:`plan_slots` because a top-up slot differs from an original one in
+    exactly one respect — where its assignment comes from — and in none of the draws below.
+    Keeping one body means a replacement record cannot drift from the shape of the record it
+    replaces.
+    """
     window_start = datetime.combine(config.time_window.start, datetime.min.time(), tzinfo=UTC)
     window_end = datetime.combine(config.time_window.end, datetime.min.time(), tzinfo=UTC)
     window_seconds = max(int((window_end - window_start).total_seconds()), 1)
     resolution_min = int(config.resolution_duration.min.total_seconds())
     resolution_max = int(config.resolution_duration.max.total_seconds())
 
-    slots: list[Slot] = []
-    for position in range(config.record_count):
-        rng = slot_random(seed, position)
-        resolution_status = pools["resolution_status"][position]
-        created_at = window_start + timedelta(seconds=rng.randrange(window_seconds))
-        # Drawn before the conditional below, and deliberately so. ``resolved_at`` consumes from
-        # this generator only for resolved tickets, so drawing the turn count afterwards made it
-        # depend on the composition assignment — a change to the resolved/escalated split moved
-        # every turn count with it. Unconditional draws come first so each stays a function of
-        # (seed, position) alone.
-        turn_count = rng.randint(config.turns.min, config.turns.max)
-        # Present when and only when the ticket was resolved (FR-006b).
-        resolved_at = (
-            created_at + timedelta(seconds=rng.randint(resolution_min, resolution_max))
-            if resolution_status == ResolutionStatus.RESOLVED
-            else None
+    rng = slot_random(seed, position)
+    resolution_status = assignment["resolution_status"]
+    created_at = window_start + timedelta(seconds=rng.randrange(window_seconds))
+    # Drawn before the conditional below, and deliberately so. ``resolved_at`` consumes from
+    # this generator only for resolved tickets, so drawing the turn count afterwards made it
+    # depend on the composition assignment — a change to the resolved/escalated split moved
+    # every turn count with it. Unconditional draws come first so each stays a function of
+    # (seed, position) alone.
+    turn_count = rng.randint(config.turns.min, config.turns.max)
+    # Present when and only when the ticket was resolved (FR-006b).
+    resolved_at = (
+        created_at + timedelta(seconds=rng.randint(resolution_min, resolution_max))
+        if resolution_status == ResolutionStatus.RESOLVED
+        else None
+    )
+    return Slot(
+        position=position,
+        category=assignment["category"],
+        priority=assignment["priority"],
+        channel=assignment["channel"],
+        resolution_status=resolution_status,
+        # Uniform over the range: naming the distribution is what stops two conforming
+        # implementations producing materially different corpora (FR-009d).
+        turn_count=turn_count,
+        subdomain="",  # assigned separately, once the document's list is known
+        created_at=created_at,
+        resolved_at=resolved_at,
+    )
+
+
+def plan_slots(config: GenerationConfig, seed: int) -> list[Slot]:
+    """Every slot for the run, in position order."""
+    pools = _assignment_pools(config, seed)
+    return [
+        _slot_at(
+            config,
+            seed,
+            position,
+            {dimension: pools[dimension][position] for dimension in COMPOSITION_DIMENSIONS},
         )
-        slots.append(
-            Slot(
-                position=position,
-                category=pools["category"][position],
-                priority=pools["priority"][position],
-                channel=pools["channel"][position],
-                resolution_status=resolution_status,
-                # Uniform over the range: naming the distribution is what stops two conforming
-                # implementations producing materially different corpora (FR-009d).
-                turn_count=turn_count,
-                subdomain="",  # assigned below, once the document's list is known
-                created_at=created_at,
-                resolved_at=resolved_at,
-            )
+        for position in range(config.record_count)
+    ]
+
+
+def plan_top_up_slots(
+    config: GenerationConfig,
+    seed: int,
+    deficit: dict[str, dict[str, int]],
+    *,
+    start_position: int,
+    count: int,
+    round_index: int,
+) -> list[Slot]:
+    """Replacement slots for records the run planned but never wrote (FR-040).
+
+    ``deficit`` is what apportionment assigned minus what the corpus actually holds, per member
+    of each dimension. Drawing the replacements from *that* rather than from the original
+    distribution is the whole point: the records that were lost are not a random sample of the
+    corpus — a category the generator handles badly is discarded more often — so replacing them
+    proportionally would leave the very drift the top-up exists to remove. Repairing the deficit
+    instead pulls achieved composition back toward assigned.
+
+    Positions continue past ``record_count`` rather than reusing the discarded ones. A position
+    whose attempts were all discarded issued no identifier, so reuse would be permitted by
+    FR-015b — but fresh positions keep writes strictly ascending, which is what lets the staging
+    file stay a prefix of the corpus and a byte offset stay a valid recovery point (research R6).
+    """
+    pools: dict[str, list[str]] = {}
+    for dimension in COMPOSITION_DIMENSIONS:
+        pool: list[str] = []
+        for member, missing in sorted(deficit.get(dimension, {}).items()):
+            pool.extend([member] * max(missing, 0))
+        # Short pools are possible: a dimension can be at or above its assignment while the
+        # corpus as a whole is short, because discards are counted per record and a record
+        # carries one member of every dimension. Top up from the requested distribution in that
+        # case — there is no deficit to repair, only a corpus to fill.
+        if len(pool) < count:
+            fallback = apportion_dimension(getattr(config.effective_composition, dimension), count)
+            for member, extra in sorted(fallback.items()):
+                pool.extend([member] * extra)
+        # Keyed by round as well as dimension: two rounds drawing the same stream would assign
+        # the same members in the same order to different positions.
+        stream_random(seed, f"topup/{round_index}/{dimension}").shuffle(pool)
+        pools[dimension] = pool
+
+    return [
+        _slot_at(
+            config,
+            seed,
+            start_position + offset,
+            {dimension: pools[dimension][offset] for dimension in COMPOSITION_DIMENSIONS},
         )
-    return slots
+        for offset in range(count)
+    ]
 
 
 def assign_subdomains(slots: Sequence[Slot], subdomains: Sequence[str], seed: int) -> list[Slot]:

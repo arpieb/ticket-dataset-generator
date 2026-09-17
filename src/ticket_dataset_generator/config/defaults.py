@@ -70,6 +70,15 @@ DEFAULT_MAX_ATTEMPTS_PER_SLOT = 3  # FR-009o
 DEFAULT_CONSECUTIVE_FAILURE_LIMIT = 50
 DEFAULT_CHECKPOINT_INTERVAL = 100  # FR-015a
 
+#: Whether a run generates replacement slots for discarded ones until the corpus actually holds
+#: `record_count` records (FR-040). On, because the alternative is a corpus that is quietly
+#: smaller than the one that was asked for -- exactly what FR-009c forbids.
+DEFAULT_TOP_UP = True
+#: The ceiling on that replacement work, as a fraction of `record_count`, across every round. A
+#: generator discarding badly enough to exhaust this is defective, and the discard-rate gates
+#: (FR-009k, FR-021a) will usually have stopped the run long before it is reached.
+DEFAULT_MAX_TOP_UP_RATIO = 0.5
+
 DEFAULT_LANGUAGE = "en"  # FR-009r
 
 #: Ticket creation times are drawn from a window ending now-ish; the default spans 180 days.
