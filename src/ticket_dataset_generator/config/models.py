@@ -210,6 +210,8 @@ class GenerationConfig(_Config):
     max_attempts_per_slot: int = Field(default=defaults.DEFAULT_MAX_ATTEMPTS_PER_SLOT, ge=1)
     consecutive_failure_limit: int = Field(default=defaults.DEFAULT_CONSECUTIVE_FAILURE_LIMIT, ge=1)
     checkpoint_interval: int = Field(default=defaults.DEFAULT_CHECKPOINT_INTERVAL, ge=1)
+    top_up: bool = defaults.DEFAULT_TOP_UP
+    max_top_up_ratio: float = Field(default=defaults.DEFAULT_MAX_TOP_UP_RATIO, ge=0.0)
 
     @property
     def effective_composition(self) -> Composition:

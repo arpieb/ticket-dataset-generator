@@ -51,7 +51,7 @@ reconciliation a sum over free text. Adding a reason is a MINOR change to the ma
 | `schema_version` | `str` | yes | `MAJOR.MINOR.PATCH` (FR-002). Every record declares the version it was written against |
 | `record_id` | `str` | yes | UUIDv5 over `f"{run_id}/{record_index}"` in a project namespace (FR-003b). Unique within a run structurally; unique across runs because `run_id` is fresh per run instance (FR-003a). A resumed run regenerating a position yields the identifier that position always had, so FR-015b holds by construction |
 | `run_id` | `str` | yes | UUIDv4 generated once per run instance and carried in the checkpoint, so a resume keeps it and a rerun gets a new one (FR-003a). Names the manifest file, so a record locates its own provenance (FR-029a) |
-| `record_index` | `int` | yes | ≥ 0. The slot this record occupies in the run; dense over `[0, N)` in a complete corpus. Makes SC-013's per-position comparison possible |
+| `record_index` | `int` | yes | ≥ 0. The slot this record occupies in the run. Ascending and distinct within a corpus, but **not dense**: discarded positions leave gaps and FR-040b's replacements sit past `record_count`, so a complete corpus of N records has a maximum index ≥ `N - 1`. Makes SC-013's per-position comparison possible |
 | `source_id` | `str` | yes | The domain prompt document identity: `f"{name}@{sha256[:12]}"` (FR-003, FR-008a) |
 | `subdomain` | `str` | yes | The subdomain assigned to this slot by a seeded choice from the prompt document's declared list (FR-008d, FR-012b). Reproducible from `(seed, position)` — this is what makes deterministic stratification possible |
 | `scenario` | `str` | yes | The specific situation the model elaborated within that subdomain, non-empty (FR-008b). Model text, not reproducible. `source_id` is common to every record and cannot serve either purpose |
@@ -138,6 +138,8 @@ manifest and hashed into the checkpoint's input fingerprint set.
 | `max_attempts_per_slot` | `int` | `3` | ≥ 1. The **single** knob for every retryable per-record failure — refusal, unparseable or invalid response, unscorable record alike (FR-009o). Distinct from transport retries, which the SDK owns and FR-012d reports separately. Exhausting it discards the slot as `attempts_exhausted` |
 | `consecutive_failure_limit` | `int` | `50` | Stops and checkpoints rather than burning the corpus (spec Edge Cases) |
 | `checkpoint_interval` | `int` | `100` | Records between checkpoints (FR-015a) |
+| `top_up` | `bool` | `true` | Generate replacement slots until the corpus holds `record_count` records (FR-040). Off, the run attempts exactly `record_count` slots and keeps what survives |
+| `max_top_up_ratio` | `float` | `0.5` | ≥ 0. Ceiling on replacement slots as a fraction of `record_count`, across every round and every resume. Reaching it with the corpus still short fails the run (FR-040c) |
 | `budget.max_runtime` | `duration \| None` | `None` | Wall-clock ceiling; exhausting it stops and checkpoints rather than failing (FR-012f) |
 | `budget.max_model_calls` | `int \| None` | `None` | Call ceiling, counting generation and judging alike (FR-012f) |
 
@@ -174,7 +176,7 @@ Not persisted in the corpus; the unit of work the pipeline schedules. Every fiel
 
 | Field | Type | Rules |
 |-------|------|-------|
-| `position` | `int` | `[0, record_count)`; the slot's position in the run, which becomes the record's `record_index`. "Slot position" is planning vocabulary; `record_index` is the contract field |
+| `position` | `int` | ≥ 0; the slot's position in the run, which becomes the record's `record_index`. Originally planned slots occupy `[0, record_count)`; FR-040b's replacement slots continue past it. "Slot position" is planning vocabulary; `record_index` is the contract field |
 | `assignment` | `TicketMetadata` fields | The four apportioned dimensions plus derived timestamps |
 | `turn_count` | `int` | Drawn **uniformly** from the configured range with the slot's own generator (FR-009d) |
 | `created_at` / `resolved_at` | `datetime` | Seeded draws from the configured window and duration bounds (FR-006a) — assigned before dispatch like every other seeded choice |
@@ -264,6 +266,7 @@ inference the tool makes on its own (FR-015g).
 | `duplicate_count` | `int` | Duplicates so far |
 | `fingerprints_path` | `path` | Sidecar holding the duplicate-detection digests, so resume does not re-scan the corpus |
 | `resumes` | `int` | Incremented on each resume (FR-015d) |
+| `top_up_slots` | `int` | Replacement slots spent so far against `max_top_up_ratio`. Carried across resumes, because a ceiling that reset on each one would be no ceiling at all (FR-040c) |
 
 ### PrivacyFinding / ApprovedException
 

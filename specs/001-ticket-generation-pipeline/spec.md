@@ -640,6 +640,33 @@ stated tolerance.
 - **FR-037a**: The **composition tolerance** (FR-031) MUST be evaluated only at completion. A partial corpus
   has no achieved composition to compare — apportionment is only satisfied once every slot has been
   attempted — so an early check would measure incompleteness rather than drift.
+- **FR-040**: `record_count` is a statement about **the corpus**, not about how many slots were
+  attempted. Once every requested slot has been attempted, a run whose corpus is short MUST generate
+  replacement slots until it holds `record_count` records. Taking discards off the top of the corpus makes
+  the delivered size a function of how badly the generator happened to behave, which is precisely what
+  FR-009c forbids doing silently.
+- **FR-040a**: Replacement slots MUST be assigned from the composition **deficit** — what apportionment
+  assigned, minus what the corpus holds, per member of each dimension — rather than from the requested
+  distribution. Records lost to discards are not a random sample of the corpus: a category the generator
+  handles badly is discarded more often, so replacing proportionally would preserve the very drift FR-031's
+  tolerance exists to catch.
+- **FR-040b**: Replacement slots MUST take **fresh positions**, continuing past `record_count`, rather than
+  reusing the positions of discarded records. Reuse would be permitted by FR-015b — a position whose attempts
+  were all discarded issued no identifier — but fresh positions keep writes strictly ascending, which is what
+  lets the staging file remain a prefix of the corpus and a byte offset remain a sufficient recovery point.
+  A complete corpus therefore has `record_count` distinct ascending `record_index` values whose maximum may
+  exceed `record_count - 1`; density over `[0, N)` is **not** a property of the corpus.
+- **FR-040c**: The replacement work MUST be bounded by a configured fraction of `record_count`, counted
+  across every round and carried across resumes. A run that reaches the bound, or produces a round with no
+  surviving record, with the corpus still short MUST **fail** — output retained in staging with its
+  manifest, nothing published. Publishing a short corpus quietly is the outcome this requirement exists to
+  prevent, and a bound that reset on resume would be no bound at all.
+- **FR-040d**: The run report MUST state the requested record count beside the written one, and how much
+  replacement work was spent reaching it. Generation beyond what was requested is the run's variable cost;
+  adding it silently would be as opaque as dropping records silently (Constitution Principle III).
+- **FR-040e**: Which replacement records a run produces is **not seeded-reproducible**, because it depends
+  on which records the judge discarded. This is the same concession FR-009q already makes, widened from
+  which positions survive to which positions exist, and is the reason FR-040d's accounting is required.
 - **FR-038**: The coherence score distribution MUST be reported as **counts in fixed buckets of 0.05 across
   the 0–1 range**, together with the count, minimum, maximum, mean, and median. Fixed buckets make two runs
   comparable without re-deriving anything; a free choice of bucketing would make every run's distribution

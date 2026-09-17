@@ -57,6 +57,17 @@ class OrderedWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     @property
+    def next_position(self) -> int:
+        """The lowest position not yet submitted or skipped — where a top-up wave continues.
+
+        Distinct from :attr:`resume_position`, which points just after the last position that
+        actually produced a record. A top-up must not reuse a position the writer has already
+        accounted for, even one that produced nothing, or the next submit would be rejected as
+        already written.
+        """
+        return self._next_position
+
+    @property
     def resume_position(self) -> int:
         """Where a resume should continue: just after the last record actually written."""
         return self.last_written_position + 1

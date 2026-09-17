@@ -251,6 +251,8 @@ know what to supply yourself.
 | `max_attempts_per_slot` | integer | `3` | ≥ 1 |
 | `consecutive_failure_limit` | integer | `50` | ≥ 1 |
 | `checkpoint_interval` | integer | `100` | ≥ 1 |
+| `top_up` | boolean | `true` | — |
+| `max_top_up_ratio` | float | `0.5` | ≥ 0 |
 
 Self-hosted models are typically slower per call and have no provider-side rate limit worth
 respecting — the bound that matters is your own server's concurrency. The Ollama samples drop to
@@ -258,6 +260,37 @@ respecting — the bound that matters is your own server's concurrency. The Olla
 
 `checkpoint_interval` should sit well inside the run's own length, or a resume has nothing recent
 to resume from. An hour-long run checkpointing every 100 records may checkpoint once.
+
+### Reaching the record count
+
+A discarded record leaves a hole in the corpus. With `top_up = true` the run fills it: once every
+requested slot has been attempted, it plans further slots — at positions past `record_count` — until
+the corpus actually holds the number that was asked for. `record_count` is therefore a statement
+about the corpus, not about how many slots were attempted.
+
+The replacements are drawn from the **deficit** rather than from the requested distribution: what
+apportionment assigned, minus what the corpus holds, per member of each dimension. Records lost to
+discards are not a random sample — a category the generator handles badly is discarded more often —
+so replacing proportionally would leave that category short. Repairing the deficit pulls achieved
+composition back toward assigned instead.
+
+`max_top_up_ratio` caps the replacement work at that fraction of `record_count`, across every round
+and across resumes. Reaching the cap with the corpus still short **fails the run**: the output stays
+in staging with its manifest and nothing is published. So does a round that produces no records at
+all, which is what a systematically unproducible slice of the corpus looks like.
+
+Two consequences are worth knowing before turning this on for a large run:
+
+- **Cost becomes variable.** A run discarding 5% of its records spends roughly 5% more model calls.
+  The run report states what was spent, under `top_up`.
+- **`record_index` is not dense.** Discarded positions leave gaps and replacements sit past
+  `record_count`, so a complete corpus of N records has N distinct ascending indices whose maximum
+  exceeds `N - 1`. Which extra records a run produces is not seed-reproducible, because it depends
+  on which records the judge discarded (FR-009q).
+
+With `top_up = false` the run attempts exactly `record_count` slots and keeps whatever survives —
+the older behaviour — but a corpus that comes up short is now reported as a failure rather than
+published quietly.
 
 ## Budget
 
